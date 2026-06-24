@@ -61,6 +61,39 @@ async function runFfmpeg(args) {
   await execFileAsync("ffmpeg", args);
 }
 
+async function transcribeAudio(audioFile) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      console.log(`Transcription attempt ${attempt}`);
+
+      const transcription = await openai.audio.transcriptions.create({
+        file: fs.createReadStream(audioFile),
+        model: "gpt-4o-mini-transcribe",
+        response_format: "json"
+      });
+
+      const text = transcription.text || "";
+
+      if (!text.trim()) {
+        throw new Error("No transcription text found");
+      }
+
+      return text;
+    } catch (error) {
+      lastError = error;
+      console.error(`Transcription attempt ${attempt} failed`, error);
+
+      if (attempt < 3) {
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+      }
+    }
+  }
+
+  throw lastError;
+}
+
 app.get("/", (req, res) => {
   res.send("Adforge backend is running");
 });
@@ -100,8 +133,10 @@ app.post("/process-video", async (req, res) => {
     const captionsFile = path.join(workDir, "captions.srt");
     const outputVideo = path.join(workDir, "output.mp4");
 
+    console.log("Downloading video");
     await downloadFile(signedRawUrl, inputVideo);
 
+    console.log("Extracting audio");
     await runFfmpeg([
       "-y",
       "-i",
@@ -112,50 +147,21 @@ app.post("/process-video", async (req, res) => {
       audioFile
     ]);
 
-    let transcription;
+    console.log("Transcribing audio");
+    const text = await transcribeAudio(audioFile);
 
-for (let attempt = 1; attempt <= 3; attempt++) {
-  try {
-    transcription = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(audioFile),
-      model: "gpt-4o-mini-transcribe",
-      response_format: "json"
-    });
-    break;
-  } catch (error) {
-    console.error(`OpenAI transcription attempt ${attempt} failed`, error);
-
-    if (attempt === 3) {
-      throw error;
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 3000));
-  }
-}
-
-const text = transcription.text || "";
-
-if (!text.trim()) {
-  throw new Error("No transcription text found");
-}
-
-const segments = [
-  {
-    start: 0,
-    end: 5,
-    text
-  }
-];
-
-    const segments = transcription.segments || [];
-
-    if (segments.length === 0) {
-      throw new Error("No transcript segments found");
-    }
+    const segments = [
+      {
+        start: 0,
+        end: 10,
+        text
+      }
+    ];
 
     const srt = segmentsToSrt(segments);
     fs.writeFileSync(captionsFile, srt);
 
+    console.log("Burning captions");
     await runFfmpeg([
       "-y",
       "-i",
@@ -167,6 +173,7 @@ const segments = [
       outputVideo
     ]);
 
+    console.log("Uploading edited video");
     const videoBuffer = fs.readFileSync(outputVideo);
 
     const uploadResult = await supabase.storage
@@ -187,8 +194,10 @@ const segments = [
         edited_path: editedUploadPath
       })
       .eq("id", jobId);
+
+    console.log("Job done", jobId);
   } catch (error) {
-    console.error(error);
+    console.error("Processing failed", error);
 
     await supabase
       .from("video_jobs")
