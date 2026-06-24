@@ -37,12 +37,10 @@ function srtTime(seconds) {
 
 function segmentsToSrt(segments) {
   return segments
-    .map((segment, index) => {
-      return `${index + 1}
+    .map((segment, index) => `${index + 1}
 ${srtTime(segment.start)} --> ${srtTime(segment.end)}
 ${segment.text.trim()}
-`;
-    })
+`)
     .join("\n");
 }
 
@@ -58,7 +56,21 @@ async function downloadFile(url, outputPath) {
 }
 
 async function runFfmpeg(args) {
-  await execFileAsync("ffmpeg", args);
+  const { stdout, stderr } = await execFileAsync("ffmpeg", args);
+  if (stdout) console.log(stdout);
+  if (stderr) console.log(stderr);
+}
+
+async function updateJob(jobId, data) {
+  const { error } = await supabase
+    .from("video_jobs")
+    .update(data)
+    .eq("id", jobId);
+
+  if (error) {
+    console.error("Supabase update error:", error);
+    throw error;
+  }
 }
 
 async function transcribeAudio(audioFile) {
@@ -83,7 +95,7 @@ async function transcribeAudio(audioFile) {
       return text;
     } catch (error) {
       lastError = error;
-      console.error(`Transcription attempt ${attempt} failed`, error);
+      console.error(`Transcription attempt ${attempt} failed:`, error?.message || error);
 
       if (attempt < 3) {
         await new Promise((resolve) => setTimeout(resolve, 3000));
@@ -120,10 +132,12 @@ app.post("/process-video", async (req, res) => {
   });
 
   try {
-    await supabase
-      .from("video_jobs")
-      .update({ status: "processing" })
-      .eq("id", jobId);
+    console.log("Starting job:", jobId);
+
+    await updateJob(jobId, {
+      status: "processing",
+      error_message: null
+    });
 
     const workDir = `/tmp/${jobId}`;
     fs.mkdirSync(workDir, { recursive: true });
@@ -150,6 +164,7 @@ app.post("/process-video", async (req, res) => {
     console.log("Transcribing audio");
     const text = await transcribeAudio(audioFile);
 
+    console.log("Creating captions");
     const segments = [
       {
         start: 0,
@@ -158,8 +173,7 @@ app.post("/process-video", async (req, res) => {
       }
     ];
 
-    const srt = segmentsToSrt(segments);
-    fs.writeFileSync(captionsFile, srt);
+    fs.writeFileSync(captionsFile, segmentsToSrt(segments));
 
     console.log("Burning captions");
     await runFfmpeg([
@@ -187,25 +201,28 @@ app.post("/process-video", async (req, res) => {
       throw uploadResult.error;
     }
 
-    await supabase
-      .from("video_jobs")
-      .update({
-        status: "done",
-        edited_path: editedUploadPath
-      })
-      .eq("id", jobId);
+    await updateJob(jobId, {
+      status: "done",
+      edited_path: editedUploadPath,
+      error_message: null
+    });
 
-    console.log("Job done", jobId);
+    console.log("Job done:", jobId);
   } catch (error) {
-    console.error("Processing failed", error);
+    const message = error?.message || String(error);
 
-    await supabase
-      .from("video_jobs")
-      .update({
+    console.error("Processing failed:", message);
+
+    try {
+      await updateJob(jobId, {
         status: "failed",
-        error_message: error.message
-      })
-      .eq("id", jobId);
+        error_message: message
+      });
+
+      console.log("Marked job as failed in Supabase");
+    } catch (supabaseError) {
+      console.error("Could not update job as failed:", supabaseError?.message || supabaseError);
+    }
   }
 });
 
