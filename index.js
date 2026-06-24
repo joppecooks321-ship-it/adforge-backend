@@ -29,7 +29,6 @@ const supabase = createClient(
     }
   }
 );
-);
 
 function srtTime(seconds) {
   const date = new Date(seconds * 1000).toISOString().slice(11, 23);
