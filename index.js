@@ -45,10 +45,14 @@ ${segment.text.trim()}
 }
 
 async function downloadFile(url, outputPath) {
-  const response = await fetch(url);
+  console.log("Download URL starts with:", String(url).slice(0, 80));
+
+  const parsedUrl = new URL(url);
+
+  const response = await fetch(parsedUrl);
 
   if (!response.ok) {
-    throw new Error(`Failed to download video: ${response.statusText}`);
+    throw new Error(`Failed to download video: ${response.status} ${response.statusText}`);
   }
 
   const arrayBuffer = await response.arrayBuffer();
@@ -56,12 +60,24 @@ async function downloadFile(url, outputPath) {
 }
 
 async function runFfmpeg(args) {
-  const { stdout, stderr } = await execFileAsync("ffmpeg", args);
-  if (stdout) console.log(stdout);
-  if (stderr) console.log(stderr);
+  console.log("Running ffmpeg:", args.join(" "));
+
+  try {
+    const { stdout, stderr } = await execFileAsync("ffmpeg", args, {
+      maxBuffer: 1024 * 1024 * 20
+    });
+
+    if (stdout) console.log("ffmpeg stdout:", stdout);
+    if (stderr) console.log("ffmpeg stderr:", stderr);
+  } catch (error) {
+    console.error("FFmpeg failed:", error?.stderr || error?.message || error);
+    throw error;
+  }
 }
 
-async function updateJob(jobId, data) {
+async function updateJobSafe(jobId, data) {
+  console.log("Updating job:", jobId, data);
+
   const { error } = await supabase
     .from("video_jobs")
     .update(data)
@@ -92,6 +108,7 @@ async function transcribeAudio(audioFile) {
         throw new Error("No transcription text found");
       }
 
+      console.log("Transcription success. Text length:", text.length);
       return text;
     } catch (error) {
       lastError = error;
@@ -106,6 +123,14 @@ async function transcribeAudio(audioFile) {
   throw lastError;
 }
 
+function makeShortCaption(text) {
+  const clean = String(text).replace(/\s+/g, " ").trim();
+
+  if (clean.length <= 180) return clean;
+
+  return clean.slice(0, 180).trim() + "...";
+}
+
 app.get("/", (req, res) => {
   res.send("Adforge backend is running");
 });
@@ -118,7 +143,13 @@ app.post("/process-video", async (req, res) => {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
-  const { jobId, signedRawUrl, editedUploadPath } = req.body;
+  const { jobId, signedRawUrl, editedUploadPath } = req.body || {};
+
+  console.log("========== REQUEST ==========");
+  console.log("jobId:", jobId);
+  console.log("signedRawUrl:", signedRawUrl);
+  console.log("editedUploadPath:", editedUploadPath);
+  console.log("=============================");
 
   if (!jobId || !signedRawUrl || !editedUploadPath) {
     return res.status(400).json({
@@ -134,7 +165,7 @@ app.post("/process-video", async (req, res) => {
   try {
     console.log("Starting job:", jobId);
 
-    await updateJob(jobId, {
+    await updateJobSafe(jobId, {
       status: "processing",
       error_message: null
     });
@@ -165,11 +196,13 @@ app.post("/process-video", async (req, res) => {
     const text = await transcribeAudio(audioFile);
 
     console.log("Creating captions");
+    const captionText = makeShortCaption(text);
+
     const segments = [
       {
         start: 0,
         end: 10,
-        text
+        text: captionText
       }
     ];
 
@@ -187,7 +220,7 @@ app.post("/process-video", async (req, res) => {
       outputVideo
     ]);
 
-    console.log("Uploading edited video");
+    console.log("Uploading edited video to path:", editedUploadPath);
     const videoBuffer = fs.readFileSync(outputVideo);
 
     const uploadResult = await supabase.storage
@@ -198,10 +231,11 @@ app.post("/process-video", async (req, res) => {
       });
 
     if (uploadResult.error) {
+      console.error("Upload error:", uploadResult.error);
       throw uploadResult.error;
     }
 
-    await updateJob(jobId, {
+    await updateJobSafe(jobId, {
       status: "done",
       edited_path: editedUploadPath,
       error_message: null
@@ -214,7 +248,7 @@ app.post("/process-video", async (req, res) => {
     console.error("Processing failed:", message);
 
     try {
-      await updateJob(jobId, {
+      await updateJobSafe(jobId, {
         status: "failed",
         error_message: message
       });
