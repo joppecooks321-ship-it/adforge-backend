@@ -112,12 +112,40 @@ app.post("/process-video", async (req, res) => {
       audioFile
     ]);
 
-    const transcription = await openai.audio.transcriptions.create({
+    let transcription;
+
+for (let attempt = 1; attempt <= 3; attempt++) {
+  try {
+    transcription = await openai.audio.transcriptions.create({
       file: fs.createReadStream(audioFile),
-      model: "whisper-1",
-      response_format: "verbose_json",
-      timestamp_granularities: ["segment"]
+      model: "gpt-4o-mini-transcribe",
+      response_format: "json"
     });
+    break;
+  } catch (error) {
+    console.error(`OpenAI transcription attempt ${attempt} failed`, error);
+
+    if (attempt === 3) {
+      throw error;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+  }
+}
+
+const text = transcription.text || "";
+
+if (!text.trim()) {
+  throw new Error("No transcription text found");
+}
+
+const segments = [
+  {
+    start: 0,
+    end: 5,
+    text
+  }
+];
 
     const segments = transcription.segments || [];
 
