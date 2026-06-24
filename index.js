@@ -1,3 +1,4 @@
+import ws from "ws";
 import express from "express";
 import cors from "cors";
 import fs from "fs";
@@ -21,7 +22,13 @@ const openai = new OpenAI({
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  {
+    realtime: {
+      transport: ws
+    }
+  }
+);
 );
 
 function srtTime(seconds) {
