@@ -4,7 +4,6 @@ import fs from "fs";
 import path from "path";
 import { execFile } from "child_process";
 import { promisify } from "util";
-import OpenAI from "openai";
 
 const execFileAsync = promisify(execFile);
 
@@ -14,46 +13,10 @@ app.use(express.json({ limit: "50mb" }));
 
 const PORT = process.env.PORT || 3000;
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
 const PROCESS_VIDEO_SECRET = process.env.PROCESS_VIDEO_SECRET;
 const PROCESS_VIDEO_URL = process.env.PROCESS_VIDEO_URL;
 
-function srtTime(seconds) {
-  const date = new Date(seconds * 1000).toISOString().slice(11, 23);
-  return date.replace(".", ",");
-}
-
-function segmentsToSrt(segments) {
-  return segments
-    .map(
-      (segment, index) => `${index + 1}
-${srtTime(segment.start)} --> ${srtTime(segment.end)}
-${segment.text.trim()}
-
-`
-    )
-    .join("");
-}
-
 async function sendCallback({ jobId, status, editedPath, errorMessage }) {
-  console.log("Sending callback:", {
-    jobId,
-    status,
-    editedPath,
-    errorMessage,
-  });
-
-  if (!PROCESS_VIDEO_URL) {
-    throw new Error("Missing PROCESS_VIDEO_URL");
-  }
-
-  if (!PROCESS_VIDEO_SECRET) {
-    throw new Error("Missing PROCESS_VIDEO_SECRET");
-  }
-
   const response = await fetch(PROCESS_VIDEO_URL, {
     method: "POST",
     headers: {
@@ -77,14 +40,10 @@ async function sendCallback({ jobId, status, editedPath, errorMessage }) {
 }
 
 async function downloadFile(url, outputPath) {
-  console.log("Download URL starts with:", String(url).slice(0, 80));
-
   const response = await fetch(url);
 
   if (!response.ok) {
-    throw new Error(
-      `Failed to download video: ${response.status} ${response.statusText}`
-    );
+    throw new Error(`Failed to download video: ${response.status}`);
   }
 
   const arrayBuffer = await response.arrayBuffer();
@@ -92,8 +51,6 @@ async function downloadFile(url, outputPath) {
 }
 
 async function uploadToSignedUrl(filePath, signedUploadUrl) {
-  console.log("Uploading edited video to signed URL");
-
   const videoBuffer = fs.readFileSync(filePath);
 
   const response = await fetch(signedUploadUrl, {
@@ -106,71 +63,19 @@ async function uploadToSignedUrl(filePath, signedUploadUrl) {
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`Failed to upload edited video: ${response.status} ${text}`);
+    throw new Error(`Failed to upload video: ${response.status} ${text}`);
   }
-
-  console.log("Upload complete");
 }
 
 async function runFfmpeg(args) {
   console.log("Running ffmpeg:", args.join(" "));
 
-  try {
-    const { stdout, stderr } = await execFileAsync("ffmpeg", args, {
-      maxBuffer: 1024 * 1024 * 20,
-    });
+  const { stdout, stderr } = await execFileAsync("ffmpeg", args, {
+    maxBuffer: 1024 * 1024 * 20,
+  });
 
-    if (stdout) console.log("ffmpeg stdout:", stdout);
-    if (stderr) console.log("ffmpeg stderr:", stderr);
-  } catch (error) {
-    console.error("FFmpeg failed:");
-    console.error(error);
-    throw error;
-  }
-}
-
-async function transcribeAudio(audioFile) {
-  let lastError;
-
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      console.log(`Transcription attempt ${attempt}`);
-
-      const transcription = await openai.audio.transcriptions.create({
-        file: fs.createReadStream(audioFile),
-        model: "whisper-1",
-        response_format: "json",
-      });
-
-      const text = transcription.text || "";
-
-      if (!text.trim()) {
-        throw new Error("No transcription text found");
-      }
-
-      console.log("Transcription success. Text length:", text.length);
-      return text;
-    } catch (error) {
-      lastError = error;
-
-      console.error(`Transcription attempt ${attempt} failed`);
-      console.error(error);
-
-      if (attempt < 3) {
-        await new Promise((resolve) => setTimeout(resolve, 3000));
-      }
-    }
-  }
-
-  throw lastError;
-}
-
-function makeShortCaption(text) {
-  const clean = String(text).replace(/\s+/g, " ").trim();
-
-  if (clean.length <= 180) return clean;
-
-  return clean.slice(0, 180).trim() + "...";
+  if (stdout) console.log(stdout);
+  if (stderr) console.log(stderr);
 }
 
 app.get("/", (req, res) => {
@@ -179,19 +84,12 @@ app.get("/", (req, res) => {
 
 app.post("/process-video", async (req, res) => {
   const authHeader = req.headers.authorization || "";
-  const expectedSecret = PROCESS_VIDEO_SECRET;
 
-  if (!expectedSecret || authHeader !== `Bearer ${expectedSecret}`) {
+  if (!PROCESS_VIDEO_SECRET || authHeader !== `Bearer ${PROCESS_VIDEO_SECRET}`) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
   const { jobId, signedRawUrl, editedUploadPath } = req.body || {};
-
-  console.log("========== REQUEST ==========");
-  console.log("jobId:", jobId);
-  console.log("signedRawUrl:", signedRawUrl);
-  console.log("editedUploadPath:", editedUploadPath);
-  console.log("=============================");
 
   if (!jobId || !signedRawUrl || !editedUploadPath) {
     return res.status(400).json({
@@ -207,52 +105,22 @@ app.post("/process-video", async (req, res) => {
   const workDir = `/tmp/${jobId}`;
 
   try {
-    console.log("Starting job:", jobId);
-
     fs.mkdirSync(workDir, { recursive: true });
 
     const inputVideo = path.join(workDir, "input.mp4");
-    const audioFile = path.join(workDir, "audio.mp3");
-    const captionsFile = path.join(workDir, "captions.srt");
     const outputVideo = path.join(workDir, "output.mp4");
 
     console.log("Downloading video");
     await downloadFile(signedRawUrl, inputVideo);
 
-    console.log("Extracting audio");
-    await runFfmpeg([
-      "-y",
-      "-i",
-      inputVideo,
-      "-vn",
-      "-acodec",
-      "mp3",
-      audioFile,
-    ]);
+    console.log("Adding fixed caption");
 
-    console.log("Transcribing audio");
-    const text = await transcribeAudio(audioFile);
-
-    console.log("Creating captions");
-    const captionText = makeShortCaption(text);
-
-    const segments = [
-      {
-        start: 0,
-        end: 10,
-        text: captionText,
-      },
-    ];
-
-    fs.writeFileSync(captionsFile, segmentsToSrt(segments));
-
-    console.log("Burning captions");
     await runFfmpeg([
       "-y",
       "-i",
       inputVideo,
       "-vf",
-      `subtitles=${captionsFile}:force_style='Fontsize=24,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=40'`,
+      "drawtext=text='Your product. Your story. Ready to scale.':fontcolor=white:fontsize=42:borderw=3:bordercolor=black:x=(w-text_w)/2:y=h-140",
       "-c:a",
       "copy",
       outputVideo,
@@ -261,7 +129,7 @@ app.post("/process-video", async (req, res) => {
     console.log("Uploading edited video");
     await uploadToSignedUrl(outputVideo, editedUploadPath);
 
-    console.log("Telling Lovable job is done");
+    console.log("Sending done callback");
     await sendCallback({
       jobId,
       status: "done",
@@ -284,7 +152,7 @@ app.post("/process-video", async (req, res) => {
         errorMessage: message,
       });
     } catch (callbackError) {
-      console.error("Could not send failed callback:");
+      console.error("Callback failed:");
       console.error(callbackError);
     }
   } finally {
