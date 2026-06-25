@@ -123,7 +123,8 @@ async function runFfmpeg(args) {
     if (stdout) console.log("ffmpeg stdout:", stdout);
     if (stderr) console.log("ffmpeg stderr:", stderr);
   } catch (error) {
-    console.error("FFmpeg failed:", error?.stderr || error?.message || error);
+    console.error("FFmpeg failed:");
+    console.error(error);
     throw error;
   }
 }
@@ -151,10 +152,9 @@ async function transcribeAudio(audioFile) {
       return text;
     } catch (error) {
       lastError = error;
-      console.error(
-        `Transcription attempt ${attempt} failed:`,
-        error?.message || error
-      );
+
+      console.error(`Transcription attempt ${attempt} failed`);
+      console.error(error);
 
       if (attempt < 3) {
         await new Promise((resolve) => setTimeout(resolve, 3000));
@@ -273,7 +273,8 @@ app.post("/process-video", async (req, res) => {
   } catch (error) {
     const message = error?.message || String(error);
 
-    console.error("Processing failed:", message);
+    console.error("Processing failed:");
+    console.error(error);
 
     try {
       await sendCallback({
@@ -283,10 +284,8 @@ app.post("/process-video", async (req, res) => {
         errorMessage: message,
       });
     } catch (callbackError) {
-      console.error(
-        "Could not send failed callback:",
-        callbackError?.message || callbackError
-      );
+      console.error("Could not send failed callback:");
+      console.error(callbackError);
     }
   } finally {
     try {
