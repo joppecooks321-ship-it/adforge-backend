@@ -65,17 +65,25 @@ async function uploadToSignedUrl(filePath, signedUploadUrl) {
     const text = await response.text();
     throw new Error(`Failed to upload video: ${response.status} ${text}`);
   }
+
+  console.log("Upload complete");
 }
 
 async function runFfmpeg(args) {
   console.log("Running ffmpeg:", args.join(" "));
 
-  const { stdout, stderr } = await execFileAsync("ffmpeg", args, {
-    maxBuffer: 1024 * 1024 * 20,
-  });
+  try {
+    const { stdout, stderr } = await execFileAsync("ffmpeg", args, {
+      maxBuffer: 1024 * 1024 * 50,
+    });
 
-  if (stdout) console.log(stdout);
-  if (stderr) console.log(stderr);
+    if (stdout) console.log(stdout);
+    if (stderr) console.log(stderr);
+  } catch (error) {
+    console.error("FFmpeg failed:");
+    console.error(error?.stderr || error);
+    throw error;
+  }
 }
 
 app.get("/", (req, res) => {
@@ -120,9 +128,19 @@ app.post("/process-video", async (req, res) => {
       "-i",
       inputVideo,
       "-vf",
-      "drawtext=text='Your product. Your story. Ready to scale.':fontcolor=white:fontsize=42:borderw=3:bordercolor=black:x=(w-text_w)/2:y=h-140",
+      "format=yuv420p,drawtext=text='Your product. Your story. Ready to scale.':fontcolor=white:fontsize=42:borderw=3:bordercolor=black:x=(w-text_w)/2:y=h-140",
+      "-c:v",
+      "libx264",
+      "-preset",
+      "veryfast",
+      "-crf",
+      "23",
       "-c:a",
-      "copy",
+      "aac",
+      "-b:a",
+      "128k",
+      "-movflags",
+      "+faststart",
       outputVideo,
     ]);
 
