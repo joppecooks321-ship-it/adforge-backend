@@ -1,4 +1,3 @@
-import ws from "ws";
 import express from "express";
 import cors from "cors";
 import fs from "fs";
@@ -6,7 +5,6 @@ import path from "path";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import OpenAI from "openai";
-import { createClient } from "@supabase/supabase-js";
 
 const execFileAsync = promisify(execFile);
 
@@ -17,18 +15,11 @@ app.use(express.json({ limit: "50mb" }));
 const PORT = process.env.PORT || 3000;
 
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
+  apiKey: process.env.OPENAI_API_KEY,
 });
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY,
-  {
-    realtime: {
-      transport: ws
-    }
-  }
-);
+const PROCESS_VIDEO_SECRET = process.env.PROCESS_VIDEO_SECRET;
+const PROCESS_VIDEO_URL = process.env.PROCESS_VIDEO_URL;
 
 function srtTime(seconds) {
   const date = new Date(seconds * 1000).toISOString().slice(11, 23);
@@ -37,26 +28,88 @@ function srtTime(seconds) {
 
 function segmentsToSrt(segments) {
   return segments
-    .map((segment, index) => `${index + 1}
+    .map(
+      (segment, index) => `${index + 1}
 ${srtTime(segment.start)} --> ${srtTime(segment.end)}
 ${segment.text.trim()}
-`)
-    .join("\n");
+
+`
+    )
+    .join("");
+}
+
+async function sendCallback({ jobId, status, editedPath, errorMessage }) {
+  console.log("Sending callback:", {
+    jobId,
+    status,
+    editedPath,
+    errorMessage,
+  });
+
+  if (!PROCESS_VIDEO_URL) {
+    throw new Error("Missing PROCESS_VIDEO_URL");
+  }
+
+  if (!PROCESS_VIDEO_SECRET) {
+    throw new Error("Missing PROCESS_VIDEO_SECRET");
+  }
+
+  const response = await fetch(PROCESS_VIDEO_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${PROCESS_VIDEO_SECRET}`,
+    },
+    body: JSON.stringify({
+      jobId,
+      status,
+      editedPath: editedPath || null,
+      errorMessage: errorMessage || null,
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Callback failed: ${response.status} ${text}`);
+  }
+
+  console.log("Callback sent");
 }
 
 async function downloadFile(url, outputPath) {
   console.log("Download URL starts with:", String(url).slice(0, 80));
 
-  const parsedUrl = new URL(url);
-
-  const response = await fetch(parsedUrl);
+  const response = await fetch(url);
 
   if (!response.ok) {
-    throw new Error(`Failed to download video: ${response.status} ${response.statusText}`);
+    throw new Error(
+      `Failed to download video: ${response.status} ${response.statusText}`
+    );
   }
 
   const arrayBuffer = await response.arrayBuffer();
   fs.writeFileSync(outputPath, Buffer.from(arrayBuffer));
+}
+
+async function uploadToSignedUrl(filePath, signedUploadUrl) {
+  console.log("Uploading edited video to signed URL");
+
+  const videoBuffer = fs.readFileSync(filePath);
+
+  const response = await fetch(signedUploadUrl, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "video/mp4",
+    },
+    body: videoBuffer,
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Failed to upload edited video: ${response.status} ${text}`);
+  }
+
+  console.log("Upload complete");
 }
 
 async function runFfmpeg(args) {
@@ -64,27 +117,13 @@ async function runFfmpeg(args) {
 
   try {
     const { stdout, stderr } = await execFileAsync("ffmpeg", args, {
-      maxBuffer: 1024 * 1024 * 20
+      maxBuffer: 1024 * 1024 * 20,
     });
 
     if (stdout) console.log("ffmpeg stdout:", stdout);
     if (stderr) console.log("ffmpeg stderr:", stderr);
   } catch (error) {
     console.error("FFmpeg failed:", error?.stderr || error?.message || error);
-    throw error;
-  }
-}
-
-async function updateJobSafe(jobId, data) {
-  console.log("Updating job:", jobId, data);
-
-  const { error } = await supabase
-    .from("video_jobs")
-    .update(data)
-    .eq("id", jobId);
-
-  if (error) {
-    console.error("Supabase update error:", error);
     throw error;
   }
 }
@@ -99,7 +138,7 @@ async function transcribeAudio(audioFile) {
       const transcription = await openai.audio.transcriptions.create({
         file: fs.createReadStream(audioFile),
         model: "gpt-4o-mini-transcribe",
-        response_format: "json"
+        response_format: "json",
       });
 
       const text = transcription.text || "";
@@ -112,7 +151,10 @@ async function transcribeAudio(audioFile) {
       return text;
     } catch (error) {
       lastError = error;
-      console.error(`Transcription attempt ${attempt} failed:`, error?.message || error);
+      console.error(
+        `Transcription attempt ${attempt} failed:`,
+        error?.message || error
+      );
 
       if (attempt < 3) {
         await new Promise((resolve) => setTimeout(resolve, 3000));
@@ -137,7 +179,7 @@ app.get("/", (req, res) => {
 
 app.post("/process-video", async (req, res) => {
   const authHeader = req.headers.authorization || "";
-  const expectedSecret = process.env.PROCESS_VIDEO_SECRET;
+  const expectedSecret = PROCESS_VIDEO_SECRET;
 
   if (!expectedSecret || authHeader !== `Bearer ${expectedSecret}`) {
     return res.status(401).json({ error: "Unauthorized" });
@@ -153,24 +195,20 @@ app.post("/process-video", async (req, res) => {
 
   if (!jobId || !signedRawUrl || !editedUploadPath) {
     return res.status(400).json({
-      error: "Missing jobId, signedRawUrl or editedUploadPath"
+      error: "Missing jobId, signedRawUrl or editedUploadPath",
     });
   }
 
   res.json({
     status: "processing",
-    jobId
+    jobId,
   });
+
+  const workDir = `/tmp/${jobId}`;
 
   try {
     console.log("Starting job:", jobId);
 
-    await updateJobSafe(jobId, {
-      status: "processing",
-      error_message: null
-    });
-
-    const workDir = `/tmp/${jobId}`;
     fs.mkdirSync(workDir, { recursive: true });
 
     const inputVideo = path.join(workDir, "input.mp4");
@@ -189,7 +227,7 @@ app.post("/process-video", async (req, res) => {
       "-vn",
       "-acodec",
       "mp3",
-      audioFile
+      audioFile,
     ]);
 
     console.log("Transcribing audio");
@@ -202,8 +240,8 @@ app.post("/process-video", async (req, res) => {
       {
         start: 0,
         end: 10,
-        text: captionText
-      }
+        text: captionText,
+      },
     ];
 
     fs.writeFileSync(captionsFile, segmentsToSrt(segments));
@@ -217,28 +255,18 @@ app.post("/process-video", async (req, res) => {
       `subtitles=${captionsFile}:force_style='Fontsize=24,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=40'`,
       "-c:a",
       "copy",
-      outputVideo
+      outputVideo,
     ]);
 
-    console.log("Uploading edited video to path:", editedUploadPath);
-    const videoBuffer = fs.readFileSync(outputVideo);
+    console.log("Uploading edited video");
+    await uploadToSignedUrl(outputVideo, editedUploadPath);
 
-    const uploadResult = await supabase.storage
-      .from("edited-videos")
-      .upload(editedUploadPath, videoBuffer, {
-        contentType: "video/mp4",
-        upsert: true
-      });
-
-    if (uploadResult.error) {
-      console.error("Upload error:", uploadResult.error);
-      throw uploadResult.error;
-    }
-
-    await updateJobSafe(jobId, {
+    console.log("Telling Lovable job is done");
+    await sendCallback({
+      jobId,
       status: "done",
-      edited_path: editedUploadPath,
-      error_message: null
+      editedPath: editedUploadPath,
+      errorMessage: null,
     });
 
     console.log("Job done:", jobId);
@@ -248,15 +276,22 @@ app.post("/process-video", async (req, res) => {
     console.error("Processing failed:", message);
 
     try {
-      await updateJobSafe(jobId, {
+      await sendCallback({
+        jobId,
         status: "failed",
-        error_message: message
+        editedPath: null,
+        errorMessage: message,
       });
-
-      console.log("Marked job as failed in Supabase");
-    } catch (supabaseError) {
-      console.error("Could not update job as failed:", supabaseError?.message || supabaseError);
+    } catch (callbackError) {
+      console.error(
+        "Could not send failed callback:",
+        callbackError?.message || callbackError
+      );
     }
+  } finally {
+    try {
+      fs.rmSync(workDir, { recursive: true, force: true });
+    } catch {}
   }
 });
 
